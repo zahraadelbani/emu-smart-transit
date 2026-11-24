@@ -1,0 +1,88 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-transit}
+      POSTGRES_USER: ${POSTGRES_USER:-transit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  migrate:
+    build: ./backend
+    env_file: .env
+    environment: { POSTGRES_HOST: db }
+    command: sh -c 'python manage.py migrate --noinput && python manage.py collectstatic --noinput'
+    volumes: ["static_data:/app/staticfiles"]
+    depends_on:
+      db: { condition: service_healthy }
+  backend:
+    build: ./backend
+    env_file: .env
+    environment: { POSTGRES_HOST: db }
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    volumes: ["static_data:/app/staticfiles"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  gps-worker:
+    build: ./backend
+    env_file: .env
+    environment: { POSTGRES_HOST: db }
+    command: python manage.py poll_gps --provider ${GPS_PROVIDER:-traccar}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+  traccar:
+    image: traccar/traccar:6.10-alpine
+    ports: ["127.0.0.1:8082:8082", "5027:5027/tcp"]
+    volumes:
+      - traccar_data:/opt/traccar/data
+      - traccar_logs:/opt/traccar/logs
+      - ./infrastructure/traccar/traccar.xml:/opt/traccar/conf/traccar.xml:ro
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_TILE_URL: ${VITE_TILE_URL:-https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png}
+        VITE_TILE_ATTRIBUTION: ${VITE_TILE_ATTRIBUTION:-&copy; OpenStreetMap contributors}
+    restart: unless-stopped
+  proxy:
+    image: nginx:1.28-alpine
+    ports: ["127.0.0.1:8080:80"]
+    volumes:
+      - ./infrastructure/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - static_data:/srv/static:ro
+    depends_on:
+      backend: { condition: service_healthy }
+      frontend: { condition: service_started }
+    restart: unless-stopped
+  https:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-bus.emu.edu.tr}
+      ACME_EMAIL: ${ACME_EMAIL:-it@example.edu.tr}
+    volumes:
+      - ./infrastructure/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [proxy]
+    restart: unless-stopped
+volumes:
+  postgres_data:
+  static_data:
+  traccar_data:
+  traccar_logs:
+  caddy_data:
+  caddy_config:
